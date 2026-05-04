@@ -1,266 +1,318 @@
-# HelloDrv — a minimal KMDF "Hello, kernel" sample
+# HelloDrv — KMDF process / image / thread monitor
 
-A tiny, non-PnP KMDF kernel driver that registers a process-create/exit
-callback and prints one `DbgPrintEx` line per event. It is intended as a
-ground-truth starting point for learning Windows kernel development with
-the WDK — small enough to read in one sitting, real enough to be useful.
+A small but feature-complete Windows kernel research project:
 
-## What it does
+- **`HelloDrv.sys`** — a non-PnP KMDF kernel driver that subscribes to three
+  documented OS notification APIs and exposes the events to user mode via
+  an IOCTL interface.
+- **`HelloDrvMonitor.exe`** — a user-mode subscriber that opens
+  `\\.\HelloDrv`, blocks for events, and prints them in a human-readable
+  table or as one JSON object per line for piping into a log analyzer.
 
-- Calls [`PsSetCreateProcessNotifyRoutineEx`](https://learn.microsoft.com/windows-hardware/drivers/ddi/ntddk/nf-ntddk-pssetcreateprocessnotifyroutineex)
-  in `DriverEntry` to register a callback.
-- On every **process create**, logs PID, PPID, image path, and command line.
-- On every **process exit**, logs the PID.
-- On **service stop / driver unload**, unregisters the callback (so the
-  kernel doesn't call into a freed image and bugcheck the box) and logs an
-  unload message.
+It is intentionally observational. The driver does **not** read another
+process's memory, hide processes, hook anti-cheat, or do anything else
+that interferes with security software — that is out of scope for this
+project, and code for that will not be added.
 
-It is deliberately:
+## What the driver hooks into
 
-- Non-PnP. No `IRP_MJ_*` dispatch, no device object, no symbolic link, no
-  control codes. Use `sc create` to install, `sc start/stop` to load/unload.
-- Single-file (`Driver.c`). Everything in ~200 lines including comments.
-- Safe to load and unload repeatedly during development.
+| Notification | API | What we capture |
+| --- | --- | --- |
+| Process create | `PsSetCreateProcessNotifyRoutineEx` | PID, PPID, image path, command line |
+| Process exit  | `PsSetCreateProcessNotifyRoutineEx` | PID |
+| Image load    | `PsSetLoadImageNotifyRoutine`       | PID, image path, kernel-image flag |
+| Thread create | `PsSetCreateThreadNotifyRoutine`    | PID, TID |
+| Thread exit   | `PsSetCreateThreadNotifyRoutine`    | PID, TID |
 
-## Layout
+The driver never sets `CreateInfo->CreationStatus`, so it can never block a
+process from starting.
+
+## Architecture
 
 ```
-hello-driver/
-├── README.md              # This file.
-└── HelloDrv/
-    ├── Driver.c           # The driver source.
-    └── HelloDrv.inx       # Optional INF template (for pnputil install).
+  +----------------------------+        +-------------------------------+
+  |  Kernel: HelloDrv.sys      |        |  User: HelloDrvMonitor.exe    |
+  |                            |        |                               |
+  |  PsSet*NotifyRoutine* -+   |        |   CreateFile("\\\\.\\HelloDrv") |
+  |                        |   |        |        |                      |
+  |                        v   |        |        v                      |
+  |   AllocEvent ----> DispatchEvent <---- IOCTL_HELLODRV_GET_NEXT_EVENT |
+  |                        |   |        |        |                      |
+  |     +------------------+---+        |        v                      |
+  |     |                  |   |        |  PrintEvent / JSON / filter  |
+  |     v                  v   |        |                               |
+  |  pending IRP queue   ring buffer    |                               |
+  |  (inverted call)     (512 max,      |                               |
+  |                       bounded FIFO) |                               |
+  +----------------------------+        +-------------------------------+
 ```
 
-## Prerequisites — the Windows DEV host
+- **Inverted call.** When user-mode calls `IOCTL_HELLODRV_GET_NEXT_EVENT`
+  and there is no event ready, the driver parks the IRP on a manual
+  KMDF queue and returns. The next time a notify callback fires, the
+  driver pulls the IRP back off the manual queue and completes it with
+  the event payload. No polling, no shared memory, no kernel events
+  exposed to user mode.
 
-Install on a normal Windows 10/11 development workstation (NOT on the
-target VM):
+- **Bounded ring buffer.** When events arrive faster than user mode is
+  draining them, they are queued on a non-paged-pool linked list capped
+  at 512 entries. If the cap is hit, the oldest event is dropped and
+  `Stats.EventsDroppedDueToBackpressure` is incremented. There is no
+  unbounded growth and no risk of exhausting non-paged pool.
 
-1. **Visual Studio 2022** (Community is fine):
-   - During install, select **Desktop development with C++**.
-   - In *Individual components*, select the latest **Windows 11 SDK**
-     (`10.0.26100.*` at the time of writing).
-   - Also select **MSVC v143 - VS 2022 C++ x64/x86 build tools** and
-     **MSVC v143 Spectre-mitigated libs** (the WDK requires the
-     Spectre-mitigated libs even for samples).
-2. **Windows Driver Kit (WDK)** matching the SDK version — download from
-   <https://learn.microsoft.com/windows-hardware/drivers/download-the-wdk>.
-   At the end of the WDK installer, **leave the "Install Visual Studio
-   extension" checkbox ticked** so VS picks up the *Kernel Mode Driver*
-   project templates.
-3. (Optional, very useful) **DebugView** from
-   <https://learn.microsoft.com/sysinternals/downloads/debugview>. We use
-   it to watch `DbgPrintEx` output live on the test VM.
-4. (Optional) **WinDbg** from
-   <https://learn.microsoft.com/windows-hardware/drivers/debugger/>. The
-   newer "WinDbg Preview" from the Microsoft Store is the most pleasant
-   way to attach a kernel debugger over the network to your VM.
+- **Stats.** `IOCTL_HELLODRV_GET_STATS` returns a `HELLODRV_STATS` struct
+  with per-event-type counters and the dropped/delivered/pending tallies.
+  `IOCTL_HELLODRV_RESET_STATS` zeroes them.
 
-To verify the install, open VS → *File → New → Project*, search for
-**“Kernel Mode Driver, Empty (KMDF)”**. If that template is present, the
-WDK is wired up correctly.
+## Repository layout
 
-## Prerequisites — the Windows TEST VM
+```
+kernel/hello-driver/
+├── README.md                   # You are here.
+├── HelloDrv/                   # Kernel driver source (build on Windows + WDK).
+│   ├── Driver.c                # DriverEntry, IOCTL handler, notify callbacks.
+│   ├── Driver.h                # Internal kernel-only declarations.
+│   ├── Public.h                # SHARED header: IOCTLs + event/stats structs.
+│   └── HelloDrv.inx            # Optional INF for `pnputil /add-driver`.
+└── HelloDrvMonitor/            # User-mode subscriber (build on Windows or Linux+MinGW).
+    ├── Monitor.c               # Open device, blocking IOCTL loop, pretty-print.
+    └── build.sh                # MinGW cross-compile script.
+```
 
-Use a **Hyper-V Generation 2** Windows 10 or 11 VM with **checkpoints
-enabled**. A bug in the driver = BSOD; checkpoints make recovery a
-30-second affair.
+`Public.h` is included from **both** the driver and the user-mode tool.
+That is the only header that crosses the kernel/user-mode boundary.
 
-> **Take a checkpoint NOW**, before you change any of the security
-> settings below. They are easy to revert from a checkpoint, painful to
-> revert by hand.
+## Prerequisites
 
-In an *Administrator* PowerShell **inside the VM**, run:
+### Dev host (where you compile)
+
+- **Visual Studio 2022** + Desktop C++ workload + Spectre-mitigated libs.
+- **Windows 11 SDK** matching the WDK (`10.0.26100.*` at the time of writing).
+- **WDK** + WDK Visual Studio extension —
+  <https://learn.microsoft.com/windows-hardware/drivers/download-the-wdk>.
+- (Optional) MinGW-w64 (`g++-mingw-w64-x86-64` on Debian/Ubuntu) if you
+  want to cross-build the user-mode tool from Linux.
+- (Optional) **DebugView** and/or **WinDbg** for live log inspection.
+
+To verify VS+WDK: *File → New → Project → "Kernel Mode Driver, Empty
+(KMDF)"* should appear.
+
+### Test VM (where you run)
+
+A **Hyper-V Generation 2** Windows 10 / 11 VM with **checkpoints**. Take a
+checkpoint *now* before you change anything below.
+
+In an Administrator PowerShell on the VM:
 
 ```powershell
-# 1. Turn off Secure Boot in the VM firmware (Hyper-V Manager → VM →
-#    Settings → Security → uncheck "Enable Secure Boot"). Do this with
-#    the VM shut down, then start the VM again.
+# Disable Secure Boot in the VM firmware (Hyper-V Manager → VM → Settings →
+# Security → uncheck "Enable Secure Boot"), with the VM shut down.
 
-# 2. Disable HVCI / Memory Integrity. Settings → Privacy & security →
-#    Windows Security → Device security → Core isolation details →
-#    Memory integrity = OFF. Reboot when prompted.
-#    On Server / LTSC builds you may need:
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" /v Enabled /t REG_DWORD /d 0 /f
+# Disable HVCI / Memory Integrity:
+#   Settings → Privacy & security → Windows Security → Device security →
+#   Core isolation → Memory integrity = OFF. Reboot.
 
-# 3. Enable test-signing. After reboot, the desktop will have a "Test
-#    Mode" watermark in the bottom-right corner -- that is how you know
-#    test-signed drivers will load.
+# Enable test signing:
 bcdedit /set testsigning on
 
-# 4. (Optional, for live kernel debugging) enable a kernel debugger over
-#    the network. Replace HOSTIP with the dev host's IP.
+# (Optional) network kernel debugger to your dev host:
 bcdedit /debug on
 bcdedit /dbgsettings net hostip:HOSTIP port:50000 key:1.2.3.4
 
 shutdown /r /t 0
 ```
 
-After reboot, confirm:
+After reboot:
 
 - `bcdedit /enum {current}` shows `testsigning Yes`.
-- The "Test Mode" watermark is visible on the desktop.
-- `Get-CimInstance Win32_DeviceGuard | Select-Object SecurityServicesRunning`
-  does **not** include the value `2` (HVCI).
+- The desktop has a "Test Mode" watermark.
+- `Get-CimInstance Win32_DeviceGuard | select SecurityServicesRunning` does
+  **not** include the value `2`.
 
 ## Building
 
-### Option A — drop into the WDK template (recommended for first-timers)
+### 1. Kernel driver — `HelloDrv.sys` (Windows + WDK only)
 
-1. In VS 2022 on the dev host: *File → New → Project → "Kernel Mode
-   Driver, Empty (KMDF)"*. Name it `HelloDrv`.
-2. Delete the auto-generated `Driver.c` if VS created one.
-3. **Add → Existing item…** and point at the `HelloDrv\Driver.c` from this
-   repo. (And `HelloDrv.inx` if you want the INF install path; otherwise
-   skip it — `sc create` works fine without an INF.)
-4. Open the project's properties:
-   - *Configuration: All configurations, Platform: x64*.
-   - *Driver Settings → General → Target OS Version*: Windows 10 or
-     later.
-   - *Driver Settings → General → Target Platform*: Desktop.
-   - *Driver Signing → General → Sign Mode*: **Test Sign**.
-   - *Driver Signing → Test Certificate*: leave as default; VS auto-
-     generates a `WDKTestCert <user>,<sha1>` cert and installs it into
-     `Cert:\CurrentUser\My`.
-5. *Build → Build Solution*. Output:
+The driver must be built on a Windows host with the WDK. Cross-compiling
+KMDF from Linux is not a supported path; the WDK build does code-analysis,
+SDV, stampinf, signing, and `inf2cat` steps that have no Linux equivalent.
 
+1. In VS 2022: *File → New → Project → "Kernel Mode Driver, Empty (KMDF)"*,
+   name it `HelloDrv`.
+2. *Add → Existing item…* and add `Driver.c`, `Driver.h`, `Public.h`, and
+   (optionally) `HelloDrv.inx` from `kernel/hello-driver/HelloDrv/`.
+3. Project properties (Configuration: All, Platform: x64):
+   - *Driver Settings → General → Target OS Version* = Windows 10 or later.
+   - *Driver Signing → General → Sign Mode* = **Test Sign**.
+   - *Driver Signing → Test Certificate* = leave default (VS will generate
+     a `WDKTestCert <user>,<sha1>` cert).
+4. *Build → Build Solution*. Output:
    ```
    HelloDrv\x64\Debug\HelloDrv\HelloDrv.sys
-   HelloDrv\x64\Debug\HelloDrv\HelloDrv.cat        (only if you used the INF)
-   HelloDrv\x64\Debug\HelloDrv\HelloDrv.inf        (only if you used the INF)
-   HelloDrv\x64\Debug\HelloDrv\WDKTestCert*.cer    (the test cert)
+   HelloDrv\x64\Debug\HelloDrv\HelloDrv.cat       (only if you used the INF)
+   HelloDrv\x64\Debug\HelloDrv\HelloDrv.inf       (only if you used the INF)
+   HelloDrv\x64\Debug\HelloDrv\WDKTestCert*.cer
    ```
 
-### Option B — command line with `MSBuild`
+### 2. User-mode subscriber — `HelloDrvMonitor.exe`
 
-From a *Developer Command Prompt for VS 2022*:
+Two equivalent paths.
 
-```cmd
-msbuild HelloDrv.sln /p:Configuration=Debug /p:Platform=x64
-```
-
-You'll still need the project to exist — Option A creates it.
-
-## Installing the test cert on the VM
-
-Copy `WDKTestCert*.cer` from the dev host to the VM, then in an
-**Administrator** PowerShell **on the VM**:
-
-```powershell
-# Install into the two stores the OS checks at driver load.
-certutil -addstore -f Root        WDKTestCert.cer
-certutil -addstore -f TrustedPublisher WDKTestCert.cer
-```
-
-You only need to do this once per VM; subsequent rebuilds reuse the same
-cert.
-
-## Installing the driver on the VM
-
-Copy `HelloDrv.sys` to the VM (e.g. `C:\Drivers\HelloDrv.sys`), then in an
-*Administrator* command prompt:
+**MSVC on Windows** (Developer Command Prompt for VS 2022):
 
 ```cmd
-sc create HelloDrv type= kernel binPath= C:\Drivers\HelloDrv.sys start= demand
-sc start  HelloDrv
+cd HelloDrvMonitor
+cl /W4 /WX /EHsc /Fe:HelloDrvMonitor.exe Monitor.c
 ```
 
-The expected output is `STATE: 4 RUNNING`. If `sc start` fails, the most
-common error codes are:
+**MinGW cross-compile on Linux:**
 
-| Error                                            | Meaning                                                    | Fix                                                                                |
-| ------------------------------------------------ | ---------------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| `577` (`ERROR_DRIVER_BLOCKED`)                   | HVCI / Memory Integrity is still on, or Secure Boot is on. | Disable both as above and reboot.                                                  |
-| `1275` (`ERROR_DRIVER_BLOCKED_LOAD`)             | Test cert isn't trusted on this VM.                        | `certutil -addstore Root` / `TrustedPublisher` with the `.cer` file.               |
-| `1058` (`ERROR_SERVICE_DISABLED`)                | Service start type set wrong.                              | `sc config HelloDrv start= demand`.                                                |
-| `5` (`ERROR_ACCESS_DENIED`)                      | Not running elevated.                                      | Run the prompt as Administrator.                                                   |
+```bash
+sudo apt-get install -y g++-mingw-w64-x86-64
+cd kernel/hello-driver/HelloDrvMonitor
+chmod +x build.sh
+./build.sh
+```
 
-## Watching the output
+Either way you get a single statically-linked `HelloDrvMonitor.exe` that
+imports only `KERNEL32.dll` and `msvcrt.dll`.
 
-### DebugView (simplest)
+## Installing & running on the test VM
 
-1. Run `DbgView.exe` on the VM **as Administrator**.
-2. *Capture menu*: enable **Capture Kernel** and **Enable Verbose Kernel
-   Output**. Optionally **Capture Win32** off to reduce noise.
-3. Re-`sc start HelloDrv` and start a few processes (open Notepad, quit
-   it). You should see lines like:
+1. Copy `HelloDrv.sys`, `HelloDrvMonitor.exe`, and the `WDKTestCert*.cer`
+   to the VM (e.g. via a Hyper-V file share or `scp`).
+2. Trust the test cert on the VM:
 
-   ```
-   [HelloDrv] DriverEntry; RegistryPath=\REGISTRY\MACHINE\System\CurrentControlSet\Services\HelloDrv
-   [HelloDrv] Registered process notify callback. Loaded.
-   [HelloDrv] Process CREATE: PID=4321, PPID=1234, Image="\Device\HarddiskVolume3\Windows\System32\notepad.exe", CmdLine=""notepad.exe""
-   [HelloDrv] Process EXIT:   PID=4321
+   ```cmd
+   certutil -addstore -f Root              WDKTestCert.cer
+   certutil -addstore -f TrustedPublisher  WDKTestCert.cer
    ```
 
-   If you see the `DriverEntry` line but no `Process CREATE` lines, your
-   process notify callback returned a non-success status — check
-   DebugView for the "PsSetCreateProcessNotifyRoutineEx ... failed" error
-   message.
+3. Install and start the kernel service:
 
-### WinDbg (kernel debugger attached over the network)
+   ```cmd
+   sc create HelloDrv type= kernel binPath= C:\Drivers\HelloDrv.sys start= demand
+   sc start  HelloDrv
+   ```
 
-In a kernel-debug session attached to the VM:
+   Expected: `STATE: 4 RUNNING`.
 
-```
-kd> ed nt!Kd_DEFAULT_Mask 0xFFFFFFFF
-kd> ed nt!Kd_IHVDRIVER_Mask 0xFFFFFFFF
-```
+4. Run the user-mode subscriber **as Administrator**:
 
-Then `g` to let the VM run; `[HelloDrv] ...` lines will appear in the
-debugger output.
+   ```cmd
+   HelloDrvMonitor.exe
+   ```
 
-## Stopping / removing
+   Open Notepad, close it, and you should see something like:
+
+   ```
+   [HelloDrvMonitor] Subscribed. Press Ctrl+C to stop.
+   [2026-05-04 13:47:02.413] PROCESS_CREATE pid=4321  ppid=1234  image="\Device\HarddiskVolume3\Windows\System32\notepad.exe" cmd=""notepad.exe""
+   [2026-05-04 13:47:02.418] IMAGE_LOAD     pid=4321  kernel=false image="\Device\HarddiskVolume3\Windows\System32\notepad.exe"
+   [2026-05-04 13:47:02.420] IMAGE_LOAD     pid=4321  kernel=false image="\Device\HarddiskVolume3\Windows\System32\ntdll.dll"
+   [2026-05-04 13:47:02.422] IMAGE_LOAD     pid=4321  kernel=false image="\Device\HarddiskVolume3\Windows\System32\kernel32.dll"
+   [2026-05-04 13:47:02.430] THREAD_CREATE  pid=4321  tid=8765
+   ...
+   [2026-05-04 13:47:09.107] THREAD_EXIT    pid=4321  tid=8765
+   [2026-05-04 13:47:09.112] PROCESS_EXIT   pid=4321
+   ```
+
+5. Useful flags:
+
+   ```cmd
+   HelloDrvMonitor.exe --no-images --no-threads          REM Quietest view.
+   HelloDrvMonitor.exe --pid 4321                        REM Filter to one PID.
+   HelloDrvMonitor.exe --image notepad                   REM Substring match.
+   HelloDrvMonitor.exe --json | python -m json.tool      REM JSON-Lines output.
+   HelloDrvMonitor.exe --stats                           REM Live counters every 1s.
+   HelloDrvMonitor.exe --reset-stats                     REM Zero counters and exit.
+   ```
+
+6. Stop / remove:
+
+   ```cmd
+   sc stop   HelloDrv
+   sc delete HelloDrv
+   ```
+
+   You should see `[HelloDrv] Unloaded.` in DebugView between `stop` and
+   `delete`.
+
+## IOCTL interface
+
+All IOCTLs are `METHOD_BUFFERED`. Definitions live in
+`HelloDrv/Public.h`.
+
+### `IOCTL_HELLODRV_GET_NEXT_EVENT`
+
+- Input: none.
+- Output: `HELLODRV_EVENT` (~3 KB, fixed size).
+- Behavior: returns the next queued event immediately, or blocks the
+  request until the next process / image / thread notification fires.
+  `bytes_returned == sizeof(HELLODRV_EVENT)` on success.
+
+### `IOCTL_HELLODRV_GET_STATS`
+
+- Input: none.
+- Output: `HELLODRV_STATS`.
+- Behavior: returns a snapshot of the per-event-type counters.
+
+### `IOCTL_HELLODRV_RESET_STATS`
+
+- Input: none.
+- Output: none.
+- Behavior: zeroes all counters.
+
+## Common failures
+
+| Symptom                                                  | Likely cause                                              | Fix                                                                  |
+| -------------------------------------------------------- | --------------------------------------------------------- | -------------------------------------------------------------------- |
+| `sc start` returns `577 ERROR_DRIVER_BLOCKED`            | HVCI / Memory Integrity is on, or Secure Boot is on       | Disable both, reboot                                                 |
+| `sc start` returns `1275 ERROR_DRIVER_BLOCKED_LOAD`      | Test cert isn't trusted on the VM                         | `certutil -addstore Root` + `TrustedPublisher` with `WDKTestCert.cer` |
+| `DriverEntry` logs `STATUS_ACCESS_DENIED` from `PsSet…Ex` | Driver image not linked with `/INTEGRITYCHECK`            | Use the WDK template; or set `<IntegrityCheck>true</IntegrityCheck>` |
+| Loads, but `Process CREATE` lines never appear           | HVCI quietly disabled the callback registration           | Confirm HVCI is off; reboot                                          |
+| `CreateFile("\\\\.\\HelloDrv")` returns 5 `ACCESS_DENIED` | User-mode tool isn't running as Administrator             | Run elevated (the SDDL only allows SYSTEM and BUILTIN\\Administrators) |
+| BSOD `DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS` on `sc stop` | Callbacks not unregistered before the image is freed | Don't modify `EvtDriverUnload` to skip the `PsRemove*` calls        |
+
+## Driver Verifier
+
+Whenever you change the driver, turn Driver Verifier on for it before
+testing:
 
 ```cmd
-sc stop   HelloDrv
-sc delete HelloDrv
+verifier /standard /driver HelloDrv.sys
+shutdown /r /t 0
 ```
 
-Confirm in DebugView you see `[HelloDrv] Unloaded.` between the `stop`
-and `delete`.
+After reboot, the Verifier flags will catch most kernel bugs at the moment
+they happen, instead of a few reboots later. Turn it off with
+`verifier /reset` once you're done.
 
-## Common pitfalls
+## What's deliberately NOT here
 
-- **BSOD `DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS`** on
-  `sc stop`: usually means a callback was not unregistered. Make sure
-  `EvtDriverUnload` calls `PsSetCreateProcessNotifyRoutineEx(..., TRUE)`
-  before returning.
-- **`Process CREATE` lines have garbage in `Image` / `CmdLine`**: those
-  fields can be `NULL` if `PROCESS_CREATE_FLAGS_FILE_SHORT_NAME` is set
-  for that process or for kernel-created processes. The sample's
-  `%wZ` formatter handles `NULL` `UNICODE_STRING` pointers safely on
-  Windows 10+, but if you hit it on older builds, gate with
-  `if (CreateInfo->ImageFileName) ...`.
-- **`PsSetCreateProcessNotifyRoutineEx` fails with `0xC0000022`
-  `STATUS_ACCESS_DENIED`**: the driver image isn't linked with
-  `/INTEGRITYCHECK`. WDK templates set this; if you're rolling your own
-  project file, add `<IntegrityCheck>true</IntegrityCheck>` under
-  `<Link>`.
-- **Driver loads but no callback fires**: HVCI/Memory Integrity quietly
-  killed your callback registration on Windows 11. Re-check it's off.
+- No `MmCopyVirtualMemory` / `NtReadVirtualMemory` / `KeStackAttachProcess`
+  IOCTL. The driver does not read another process's address space.
+- No `PsActiveProcessHead` traversal, no DKOM, no `EPROCESS` patching, no
+  hiding of the driver, of its service, or of any process from any tool.
+- No SSDT / IRP / inline / IAT hooks; no patching of any kernel callback;
+  no interference with anti-cheat, anti-virus, or PatchGuard.
 
-## Where to go next
+If your project needs any of those primitives, this is not the right
+starting point and I will not extend it in that direction.
 
-Once this driver loads and you see live process events:
+## Where to go next (legitimate)
 
-- Add a control device (`WdfDeviceCreate` + a symbolic link) and an IOCTL
-  so a user-mode helper can subscribe to events instead of dumping them
-  to `DbgPrint`.
-- Look at the official samples in
-  <https://github.com/microsoft/Windows-driver-samples>, especially
-  `general/echo` (KMDF basics) and `filesys/miniFilter` (file system
-  callbacks).
-- Read [*Windows Kernel Programming, 2nd ed.* by Pavel Yosifovich] —
-  the canonical practical book on KMDF.
-- Read the WDK [Driver Verifier docs](https://learn.microsoft.com/windows-hardware/drivers/devtest/driver-verifier)
-  and turn it on for `HelloDrv` (`verifier /standard /driver HelloDrv.sys`)
-  the first time you change anything non-trivial. It catches a huge
-  fraction of kernel bugs at the moment they happen instead of two
-  reboots later.
+- Add a `WdfFileObject` per-handle context so each opener gets its own
+  per-handle event queue (currently all openers share one ring).
+- Replace the inline-string event payload with a variable-length packed
+  format so events for very long command lines aren't truncated.
+- Add a Filter Manager mini-filter (`FltRegisterFilter`) for file system
+  events. See the WDK `filesys/miniFilter` samples.
+- Add ETW-style structured logging (TraceLogging) instead of `DbgPrintEx`.
+- Read [*Windows Kernel Programming, 2nd ed.* by Pavel Yosifovich] and
+  the WDK [Driver Verifier docs](https://learn.microsoft.com/windows-hardware/drivers/devtest/driver-verifier).
 
 ## License
 
 Public domain / MIT-style: do whatever you want with this sample, no
-warranty. Don't ship it as a product without removing the `DbgPrintEx`
-spam.
+warranty.
