@@ -1,0 +1,58 @@
+;
+; HelloDrv.inx -- INF template for the HelloDrv KMDF sample driver.
+;
+; This INF is OPTIONAL: HelloDrv is a software-only driver and can be
+; installed by hand with `sc create` (see README). The INF is provided so
+; you can also install it the "proper" way with `pnputil /add-driver` or
+; the WDK's "Deploy" feature in Visual Studio.
+;
+; `stampinf` (run from the WDK build) replaces $ARCH$, the date, and the
+; version, producing HelloDrv.inf.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider    = %ManufacturerName%
+DriverVer   =
+CatalogFile = HelloDrv.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+HelloDrv.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%DeviceDesc% = HelloDrv_Device, Root\HelloDrv
+
+[HelloDrv_Device.NT]
+CopyFiles = HelloDrv.CopyFiles
+
+[HelloDrv.CopyFiles]
+HelloDrv.sys
+
+[HelloDrv_Device.NT.Services]
+AddService = HelloDrv,%SPSVCINST_ASSOCSERVICE%, HelloDrv_Service
+
+[HelloDrv_Service]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1                  ; SERVICE_KERNEL_DRIVER
+StartType      = 3                  ; SERVICE_DEMAND_START
+ErrorControl   = 1                  ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\HelloDrv.sys
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName       = "HelloDrv Sample"
+DiskName               = "HelloDrv Installation Disk"
+DeviceDesc             = "HelloDrv KMDF Sample Driver"
+ServiceDesc            = "HelloDrv KMDF Sample Service"
