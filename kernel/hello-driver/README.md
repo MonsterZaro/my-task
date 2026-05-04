@@ -68,15 +68,21 @@ process from starting.
 
 ```
 kernel/hello-driver/
-├── README.md                   # You are here.
-├── HelloDrv/                   # Kernel driver source (build on Windows + WDK).
-│   ├── Driver.c                # DriverEntry, IOCTL handler, notify callbacks.
-│   ├── Driver.h                # Internal kernel-only declarations.
-│   ├── Public.h                # SHARED header: IOCTLs + event/stats structs.
-│   └── HelloDrv.inx            # Optional INF for `pnputil /add-driver`.
-└── HelloDrvMonitor/            # User-mode subscriber (build on Windows or Linux+MinGW).
-    ├── Monitor.c               # Open device, blocking IOCTL loop, pretty-print.
-    └── build.sh                # MinGW cross-compile script.
+├── README.md                            # You are here.
+├── HelloDrv.sln                         # VS solution: open this in VS 2022+.
+├── HelloDrv/                            # Kernel driver source (build on Windows + WDK).
+│   ├── HelloDrv.vcxproj                 # KMDF driver project (x64 Debug + Release).
+│   ├── HelloDrv.vcxproj.Filters         # Solution Explorer source organization.
+│   ├── Driver.c                         # DriverEntry, IOCTL handler, notify callbacks.
+│   ├── Driver.h                         # Internal kernel-only declarations.
+│   ├── Public.h                         # SHARED header: IOCTLs + event/stats structs.
+│   └── HelloDrv.inx                     # Optional INF for `pnputil /add-driver`.
+└── HelloDrvMonitor/                     # User-mode subscriber (build on Windows or Linux+MinGW).
+    ├── HelloDrvMonitor.vcxproj          # User-mode console-app project.
+    ├── HelloDrvMonitor.vcxproj.Filters  # Solution Explorer source organization.
+    ├── Monitor.c                        # Open device, blocking IOCTL loop, pretty-print.
+    ├── build.sh                         # MinGW cross-compile script (Linux).
+    └── HelloDrvMonitor.exe              # Pre-built static x86_64 binary (MinGW).
 ```
 
 `Public.h` is included from **both** the driver and the user-mode tool.
@@ -131,41 +137,70 @@ After reboot:
 
 ## Building
 
-### 1. Kernel driver — `HelloDrv.sys` (Windows + WDK only)
+### 1. Open the solution
 
-The driver must be built on a Windows host with the WDK. Cross-compiling
-KMDF from Linux is not a supported path; the WDK build does code-analysis,
-SDV, stampinf, signing, and `inf2cat` steps that have no Linux equivalent.
-
-1. In VS 2022: *File → New → Project → "Kernel Mode Driver, Empty (KMDF)"*,
-   name it `HelloDrv`.
-2. *Add → Existing item…* and add `Driver.c`, `Driver.h`, `Public.h`, and
-   (optionally) `HelloDrv.inx` from `kernel/hello-driver/HelloDrv/`.
-3. Project properties (Configuration: All, Platform: x64):
-   - *Driver Settings → General → Target OS Version* = Windows 10 or later.
-   - *Driver Signing → General → Sign Mode* = **Test Sign**.
-   - *Driver Signing → Test Certificate* = leave default (VS will generate
-     a `WDKTestCert <user>,<sha1>` cert).
-4. *Build → Build Solution*. Output:
-   ```
-   HelloDrv\x64\Debug\HelloDrv\HelloDrv.sys
-   HelloDrv\x64\Debug\HelloDrv\HelloDrv.cat       (only if you used the INF)
-   HelloDrv\x64\Debug\HelloDrv\HelloDrv.inf       (only if you used the INF)
-   HelloDrv\x64\Debug\HelloDrv\WDKTestCert*.cer
-   ```
-
-### 2. User-mode subscriber — `HelloDrvMonitor.exe`
-
-Two equivalent paths.
-
-**MSVC on Windows** (Developer Command Prompt for VS 2022):
-
-```cmd
-cd HelloDrvMonitor
-cl /W4 /WX /EHsc /Fe:HelloDrvMonitor.exe Monitor.c
+```
+kernel\hello-driver\HelloDrv.sln
 ```
 
-**MinGW cross-compile on Linux:**
+The solution contains two projects:
+
+| Project           | ConfigurationType | PlatformToolset                | Output                     |
+| ----------------- | ----------------- | ------------------------------ | -------------------------- |
+| `HelloDrv`        | `Driver`          | `WindowsKernelModeDriver10.0`  | `HelloDrv.sys` (+ `.inf`, `.cat`, `WDKTestCert*.cer`) |
+| `HelloDrvMonitor` | `Application`     | `v143` (VS 2022 MSVC)          | `HelloDrvMonitor.exe`      |
+
+Both projects ship with two configurations: **Debug | x64** and **Release | x64**.
+For the deployable `.sys` you ship to the test VM, switch the configuration
+dropdown in the VS toolbar to **Release | x64** before building.
+
+If your VS install is a newer version than 17.x, the IDE will offer to retarget
+the projects on first open — accept the defaults. The retarget binds the
+projects to whatever toolset and Windows SDK / WDK your install has.
+
+### 2. One-time prerequisites in the VS Installer
+
+The solution will fail to build if these aren't present. Open the Visual
+Studio Installer → *Modify* on your VS install:
+
+- **Workloads** → *Desktop development with C++*.
+- **Individual components**:
+  - *MSVC v143 - VS 2022 C++ x64/x86 build tools (Latest)* (or your VS's equivalent).
+  - **MSVC v143 — VS 2022 C++ x64/x86 Spectre-mitigated libs (Latest)**
+    *(required by `<SpectreMitigation>Spectre</SpectreMitigation>` — without
+    this you'll get "spectre-mitigated runtime library not found" at link time)*.
+  - *Latest Windows 11 SDK*.
+  - *C++ ATL for latest v143 build tools (x86 & x64)*  *(WDK transitively wants this)*.
+
+Plus the WDK itself (separate installer):
+<https://learn.microsoft.com/windows-hardware/drivers/download-the-wdk>.
+The WDK installer ends by offering to install the *WDK Visual Studio
+extension* — say yes; without it VS won't see the `WindowsKernelModeDriver10.0`
+toolset and the `HelloDrv` project will fail to load.
+
+### 3. Build
+
+In Visual Studio: select **Release | x64** in the toolbar → *Build → Build Solution*.
+
+Output goes to `kernel\hello-driver\build\x64\Release\<ProjectName>\`:
+
+```
+build\x64\Release\HelloDrv\HelloDrv.sys
+build\x64\Release\HelloDrv\HelloDrv.inf
+build\x64\Release\HelloDrv\HelloDrv.cat
+build\x64\Release\HelloDrv\WDKTestCert*.cer
+build\x64\Release\HelloDrvMonitor\HelloDrvMonitor.exe
+```
+
+The `WDKTestCert*.cer` is auto-generated by the WDK signing step using the
+identity you configure under *Project → Properties → Driver Signing →
+Test Certificate*. The first build will create one for you; subsequent
+builds re-use it.
+
+### Building the user-mode tool from Linux (alternative)
+
+If you only need the `.exe` and not a full VS install, the user-mode tool
+also cross-compiles from Linux with MinGW:
 
 ```bash
 sudo apt-get install -y g++-mingw-w64-x86-64
@@ -174,8 +209,9 @@ chmod +x build.sh
 ./build.sh
 ```
 
-Either way you get a single statically-linked `HelloDrvMonitor.exe` that
-imports only `KERNEL32.dll` and `msvcrt.dll`.
+Output: a single statically-linked `HelloDrvMonitor.exe` importing only
+`KERNEL32.dll` and `msvcrt.dll`. The kernel driver `.sys` itself still
+has to be built on Windows with the WDK.
 
 ## Installing & running on the test VM
 

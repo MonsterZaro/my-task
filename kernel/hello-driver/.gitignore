@@ -1,0 +1,28 @@
+# Visual Studio build outputs
+build/
+x64/
+Debug/
+Release/
+*.user
+*.suo
+*.opensdf
+*.sdf
+.vs/
+ipch/
+
+# WDK / signing artifacts produced at build time
+*.sys
+*.pdb
+*.cat
+*.inf.bak
+*.idb
+*.obj
+*.lib
+*.exp
+*.ilk
+*.tlog
+*.log
+*.metagen
+
+# Allow the checked-in pre-built MinGW user-mode binary
+!HelloDrvMonitor/HelloDrvMonitor.exe
