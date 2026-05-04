@@ -352,10 +352,10 @@ main(int argc, char* argv[])
                 fprintf(stderr, "Too many --image filters (max %d)\n", MAX_IMAGE_FILTERS);
                 return 1;
             }
-            strncpy(opt.imageFilters[opt.imageFilterCount],
-                    argv[++i],
-                    sizeof(opt.imageFilters[0]) - 1);
-            opt.imageFilters[opt.imageFilterCount][sizeof(opt.imageFilters[0]) - 1] = '\0';
+            strncpy_s(opt.imageFilters[opt.imageFilterCount],
+                      sizeof(opt.imageFilters[0]),
+                      argv[++i],
+                      _TRUNCATE);
             opt.imageFilterCount++;
         } else {
             fprintf(stderr, "Unknown argument: %s\n", a);
